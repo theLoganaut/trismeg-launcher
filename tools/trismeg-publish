@@ -394,7 +394,8 @@ def publish_launcher(a) -> None:
                 uploads.append((z, f"launcher/TrismegLauncher-{platform}.zip", NO_CACHE, "application/zip"))
             if not platforms:
                 fail("no export templates found for any platform")
-            manifest["engine"] = {"version": engine, "extensions": [], "platforms": platforms}
+            extensions = sorted(p.parent.name for p in (project / "addons").glob("*/*.gdextension"))
+            manifest["engine"] = {"version": engine, "extensions": extensions, "platforms": platforms}
 
         step(f"exporting \"{UI_PRESET}\"")
         pck = tmp / f"{version}.pck"

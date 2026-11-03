@@ -1,0 +1,19 @@
+; GodotSteam, the same build Collimators uses (copied from its addons/godotsteam). The
+; launcher doesn't call Steam itself: it ships these libraries so games it runs with
+; --main-pack find them next to the executable (Contents/Frameworks on macOS). Games and
+; the launcher must use the same GodotSteam build; the filenames below must match theirs.
+
+[configuration]
+entry_symbol = "godotsteam_init"
+compatibility_minimum = "4.4"
+
+[libraries]
+macos.debug = "res://addons/godotsteam/osx/libgodotsteam.macos.template_debug.universal.dylib"
+macos.release = "res://addons/godotsteam/osx/libgodotsteam.macos.template_release.universal.dylib"
+windows.release.x86_64 = "res://addons/godotsteam/win64/libgodotsteam.windows.template_release.x86_64.dll"
+linux.release.x86_64 = "res://addons/godotsteam/linux64/libgodotsteam.linux.template_release.x86_64.so"
+
+[dependencies]
+macos.universal = { "res://addons/godotsteam/osx/libsteam_api.dylib": "" }
+windows.x86_64 = { "res://addons/godotsteam/win64/steam_api64.dll": "" }
+linux.x86_64 = { "res://addons/godotsteam/linux64/libsteam_api.so": "" }

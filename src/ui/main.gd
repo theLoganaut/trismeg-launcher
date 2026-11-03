@@ -495,13 +495,15 @@ func _gap(h: float) -> Control:
 	return c
 
 
-## Development only: `-- --screenshot=out.png [--open=<id>] [--view=<key>]` saves the
-## window a few seconds after start and quits.
+## Development only: `-- --play=<id>` installs and starts a game; `-- --screenshot=out.png
+## [--open=<id>] [--view=<key>]` saves the window a few seconds after start and quits.
 func _dev_flags() -> void:
 	var shot := ""
 	for a in OS.get_cmdline_user_args():
 		if a.begins_with("--screenshot="):
 			shot = a.get_slice("=", 1)
+		elif a.begins_with("--play="):
+			_dev_play(a.get_slice("=", 1))
 		elif a.begins_with("--view="):
 			_nav[a.get_slice("=", 1)].button_pressed = true
 			_set_view(a.get_slice("=", 1))
@@ -514,3 +516,11 @@ func _dev_flags() -> void:
 			await get_tree().create_timer(1.0).timeout
 	get_viewport().get_texture().get_image().save_png(shot)
 	get_tree().quit()
+
+
+func _dev_play(id: String) -> void:
+	while lib.refreshing or not lib.games.has(id):
+		await get_tree().process_frame
+	if lib.games[id].installed.is_empty():
+		await lib.install(id)
+	lib.play(id)

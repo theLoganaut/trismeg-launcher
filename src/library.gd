@@ -274,10 +274,15 @@ func play(id: String) -> void:
 		game_changed.emit(id)
 		catalog_changed.emit()
 		return
-	var args := PackedStringArray(["--main-pack", path])
+	var exe := OS.get_executable_path()
+	var args := PackedStringArray()
+	if OS.has_feature("editor"):  # the editor binary takes --main-pack; export templates don't
+		args.append_array(["--main-pack", path])
+	else:
+		exe = _runner(g)
 	for a: Variant in g.manifest.get("args", []):
 		args.append(str(a))
-	var pid := OS.create_process(OS.get_executable_path(), args)
+	var pid := OS.create_process(exe, args) if exe else -1
 	if pid <= 0:
 		g.error = "Couldn't start the game"
 	else:
@@ -286,6 +291,65 @@ func play(id: String) -> void:
 		g.installed.last_played = Fmt.now()
 		_save()
 	game_changed.emit(id)
+
+
+# Official export templates ignore --main-pack, so each game runs from its own copy of the
+# launcher's engine in user://games/<id>/run/: the executable (on macOS its whole .app) with
+# the game's build beside it under the executable's name, which Godot loads as its main
+# pack, and the native libraries the engine ships with (GodotSteam), which Godot looks for
+# next to the executable. Copies are hard links or APFS clones where the disk allows.
+
+## The executable that runs the game's installed build, or "" if it couldn't be set up.
+func _runner(g: Game) -> String:
+	var exe := OS.get_executable_path()
+	var run := ProjectSettings.globalize_path(GAMES + g.id + "/run")
+	var build := ProjectSettings.globalize_path(g.installed.path)
+	var stamp := "%s|%d|%s" % [exe, FileAccess.get_modified_time(exe), build]
+	var target := run.path_join(exe.get_file())
+	if OS.get_name() == "macOS":
+		var app := exe.get_base_dir().get_base_dir().get_base_dir()  # …/Trismeg Launcher.app
+		target = run.path_join(app.get_file()).path_join("Contents/MacOS").path_join(exe.get_file())
+	if FileAccess.file_exists(target) and FileAccess.get_file_as_string(run.path_join("runner.txt")) == stamp:
+		return target
+	if DirAccess.dir_exists_absolute(run):
+		_remove_dir(run)
+	DirAccess.make_dir_recursive_absolute(run)
+	var pck := run.path_join(exe.get_file().get_basename() + ".pck")
+	if OS.get_name() == "macOS":
+		var app := exe.get_base_dir().get_base_dir().get_base_dir()
+		var copy := run.path_join(app.get_file())
+		# -X leaves the download's quarantine flag behind; -c clones instead of copying
+		if OS.execute("cp", ["-R", "-c", "-X", app, copy]) != 0 and OS.execute("cp", ["-R", "-X", app, copy]) != 0:
+			return ""
+		pck = copy.path_join("Contents/Resources").path_join(exe.get_file() + ".pck")
+	else:
+		if _link(exe, target) != OK:
+			return ""
+		FileAccess.set_unix_permissions(target, 493)  # rwxr-xr-x
+		for f in DirAccess.get_files_at(exe.get_base_dir()):
+			if f.get_extension() in ["dll", "so"]:
+				_link(exe.get_base_dir().path_join(f), run.path_join(f))
+	if _link(build, pck) != OK:
+		return ""
+	var f := FileAccess.open(run.path_join("runner.txt"), FileAccess.WRITE)
+	f.store_string(stamp)
+	return target
+
+
+## Hard link (APFS clone on macOS), falling back to a plain copy.
+func _link(from: String, to: String) -> Error:
+	DirAccess.remove_absolute(to)
+	var code := -1
+	match OS.get_name():
+		"Windows":
+			code = OS.execute("cmd.exe", ["/c", "mklink", "/H", to.replace("/", "\\"), from.replace("/", "\\")])
+		"macOS":
+			code = OS.execute("cp", ["-c", from, to])
+		_:
+			code = OS.execute("ln", [from, to])
+	if code == 0 and FileAccess.file_exists(to):
+		return OK
+	return DirAccess.copy_absolute(from, to)
 
 
 func rollback(id: String) -> void:
