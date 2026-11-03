@@ -1,0 +1,23 @@
+{
+  "collimators": {
+    "path": "~/collimators--frontlines",
+    "name": "Collimators: Frontlines",
+    "tagline": "Turn-based mech roguelike where your loadout is your deck",
+    "order": 10,
+    "extensions": { "godotsteam": "optional" },
+    "env_file": "tools/steam/config.sh",
+    "build_info_env": { "feedback_webhook": "FEEDBACK_WEBHOOK" }
+  },
+  "squadbeasts": {
+    "path": "~/squad-beasts",
+    "name": "SquadBeasts",
+    "tagline": "Raise a beast, then battle it",
+    "order": 20
+  },
+  "outer-rim-racers": {
+    "path": "~/outer-rim-racers",
+    "name": "Outer Rim Racers",
+    "tagline": "Retro anti-grav racing",
+    "order": 30
+  }
+}

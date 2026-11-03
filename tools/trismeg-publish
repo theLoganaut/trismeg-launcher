@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""Publish a game build to the Trismeg Launcher.
+
+  trismeg-publish <id>                      beta build of HEAD
+  trismeg-publish <id> --stable [vX.Y.Z]    stable build; tags HEAD with the version
+                                            unless HEAD is already tagged
+Options:
+  --notes "text"    release notes (default: the last commit's subject)
+  --dry-run         export and build the manifest, but upload, tag and push nothing
+  --no-push         publish, but don't push the commit and tag to GitHub
+  --keep N          builds to keep per channel (default 3)
+
+Follows "Build format v1" on the Trismeg Launcher page in Notion:
+  1. refuses to run with uncommitted changes
+  2. version from git describe (beta: v0.2.0-14-g2ef350e; stable: the tag)
+  3. writes build_info.json, exports the "Launcher pck" preset, deletes the file
+  4. uploads games/<id>/builds/<version>.pck, then manifest.json, then index.json
+  5. prunes builds that fell out of the last N per channel
+  6. pushes the commit (and tag) to origin
+
+Games are listed in games.json next to this script. Uploads go through the
+rclone remote "r2" (keys stay in rclone's config). Environment:
+  GODOT            Godot binary (default: the one in /Applications)
+  TRISMEG_PREFIX   path prefix inside the bucket, for testing ("_test/")
+  TRISMEG_GAMES    a different games.json, for testing
+"""
+
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REMOTE = "r2:trismeg-launcher"
+PUBLIC = "https://builds.trismegstudios.com"
+PRESET = "Launcher pck"
+SCHEMA = 1
+GODOT = os.environ.get("GODOT", "/Applications/Godot.app/Contents/MacOS/Godot")
+PREFIX = os.environ.get("TRISMEG_PREFIX", "")
+GAMES = Path(os.environ.get("TRISMEG_GAMES", Path(__file__).resolve().parent / "games.json"))
+
+IMMUTABLE = "public, max-age=31536000, immutable"
+NO_CACHE = "no-cache"
+
+
+def fail(msg: str) -> None:
+    print(f"trismeg-publish: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def step(msg: str) -> None:
+    print(f"== {msg}", flush=True)
+
+
+def run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> str:
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        fail(f"{' '.join(cmd[:3])} failed:\n{r.stderr.strip() or r.stdout.strip()}")
+    return r.stdout.strip()
+
+
+def git(project: Path, *args: str, check: bool = True) -> str:
+    return run(["git", *args], cwd=project, check=check)
+
+
+# --- the bucket ------------------------------------------------------------
+
+def key(path: str) -> str:
+    return f"{REMOTE}/{PREFIX}{path}"
+
+
+def read_json(path: str, default):
+    r = subprocess.run(["rclone", "cat", key(path)], capture_output=True, text=True)
+    if r.returncode != 0:
+        if "not found" in r.stderr.lower() or "doesn't exist" in r.stderr.lower():
+            return default
+        fail(f"couldn't read {path}:\n{r.stderr.strip()}")
+    return json.loads(r.stdout) if r.stdout.strip() else default
+
+
+def upload(local: Path, path: str, cache: str, content_type: str) -> None:
+    run(["rclone", "copyto", str(local), key(path),
+         "--header-upload", f"Cache-Control: {cache}",
+         "--header-upload", f"Content-Type: {content_type}"])
+
+
+def upload_json(data, path: str, tmp: Path) -> None:
+    f = tmp / Path(path).name
+    f.write_text(json.dumps(data, indent=2) + "\n")
+    upload(f, path, NO_CACHE, "application/json")
+
+
+def size_in_bucket(path: str) -> int | None:
+    r = subprocess.run(["rclone", "lsjson", key(path)], capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    entries = json.loads(r.stdout or "[]")
+    return entries[0]["Size"] if entries else None
+
+
+# --- the game --------------------------------------------------------------
+
+def godot_version(project: Path) -> str:
+    m = re.search(r'config/features=PackedStringArray\("(\d+\.\d+)"', (project / "project.godot").read_text())
+    return m.group(1) if m else "?"
+
+
+def engine_version() -> str:
+    m = re.match(r"(\d+\.\d+)", run([GODOT, "--version"]))
+    return m.group(1) if m else "?"
+
+
+def env_values(project: Path, env_file: str, names: dict[str, str]) -> dict[str, str]:
+    """Reads variables from a shell config (e.g. the Discord webhook) without printing them."""
+    script = f'source "{project / env_file}" >/dev/null 2>&1; ' + "; ".join(
+        f'printf "%s\\0" "${{{var}}}"' for var in names.values())
+    out = subprocess.run(["bash", "-c", script], capture_output=True, text=True).stdout.split("\0")
+    return {k: v for k, v in zip(names, out) if v}
+
+
+def version_for(project: Path, stable: bool, wanted: str | None) -> tuple[str, bool]:
+    """(version, needs_tag)"""
+    if stable:
+        on_head = git(project, "tag", "--points-at", "HEAD").split()
+        tags = [t for t in on_head if re.fullmatch(r"v\d+\.\d+\.\d+", t)]
+        if wanted:
+            if not re.fullmatch(r"v\d+\.\d+\.\d+", wanted):
+                fail(f"stable versions look like v1.2.3, not {wanted}")
+            if wanted in tags:
+                return wanted, False
+            if git(project, "tag", "--list", wanted):
+                fail(f"{wanted} already tags another commit")
+            return wanted, True
+        if tags:
+            return sorted(tags)[-1], False
+        fail("HEAD has no version tag: pass one, e.g. --stable v0.3.0")
+    if git(project, "describe", "--tags", "--abbrev=0", check=False):
+        return git(project, "describe", "--tags", "--long", "--abbrev=7"), False
+    # no tags yet: count every commit as being since v0.0.0
+    count = git(project, "rev-list", "--count", "HEAD")
+    return f"v0.0.0-{count}-g{git(project, 'rev-parse', '--short=7', 'HEAD')}", False
+
+
+def export_pck(project: Path, out: Path, build_info: dict) -> None:
+    info_file = project / "build_info.json"
+    if info_file.exists():
+        fail(f"{info_file} already exists (left over from another export?); delete it first")
+    before = (project / "project.godot").read_bytes()
+    info_file.write_text(json.dumps(build_info) + "\n")
+    try:
+        r = subprocess.run([GODOT, "--headless", "--path", str(project), "--export-pack", PRESET, str(out)],
+                           capture_output=True, text=True)
+    finally:
+        info_file.unlink(missing_ok=True)
+    log = out.with_suffix(".log")
+    log.write_text(r.stdout + r.stderr)
+    if r.returncode != 0 or not out.exists() or out.stat().st_size == 0:
+        fail(f"export failed, see {log}")
+    if (project / "project.godot").read_bytes() != before:
+        (project / "project.godot").write_bytes(before)
+        print("   (Godot rewrote project.godot during the export; put it back)")
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# --- main ------------------------------------------------------------------
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("id")
+    ap.add_argument("--stable", nargs="?", const=True, default=False, metavar="vX.Y.Z")
+    ap.add_argument("--notes")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--no-push", action="store_true")
+    ap.add_argument("--keep", type=int, default=3)
+    a = ap.parse_args()
+
+    games = json.loads(GAMES.read_text())
+    if a.id not in games:
+        fail(f"unknown game {a.id!r}; known: {', '.join(games)} (add it to {GAMES})")
+    g = games[a.id]
+    project = Path(os.path.expanduser(g["path"]))
+    stable = a.stable is not False
+    channel = "stable" if stable else "beta"
+
+    step(f"{g['name']} ({channel}){' [dry run]' if a.dry_run else ''}{' [prefix ' + PREFIX + ']' if PREFIX else ''}")
+    if not (project / ".git").exists():
+        fail(f"{project} isn't a git repo yet (step 2.5)")
+    if dirty := git(project, "status", "--porcelain"):
+        fail(f"uncommitted changes in {project}; commit or stash them first:\n{dirty}")
+    gv, ev = godot_version(project), engine_version()
+    if gv != ev:
+        fail(f"the game is on Godot {gv} but the launcher's engine is {ev}; move the project to {ev} first")
+
+    version, needs_tag = version_for(project, stable, a.stable if isinstance(a.stable, str) else None)
+    commit = git(project, "rev-parse", "--short=7", "HEAD")
+    notes = a.notes if a.notes is not None else git(project, "log", "-1", "--format=%s")
+    now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    print(f"   version {version}, commit {commit}")
+
+    build_info = {"version": version, "channel": channel, "commit": commit,
+                  "stamp": now.astimezone().strftime("%Y-%m-%d %H:%M")}
+    if g.get("env_file"):
+        build_info |= env_values(project, g["env_file"], g.get("build_info_env", {}))
+
+    with tempfile.TemporaryDirectory(prefix="trismeg-publish-") as t:
+        tmp = Path(t)
+        pck = tmp / f"{version}.pck"
+        step(f"exporting \"{PRESET}\" with Godot {ev}")
+        export_pck(project, pck, build_info)
+        size, digest = pck.stat().st_size, sha256(pck)
+        print(f"   {size / 1e6:.1f} MB, sha256 {digest[:12]}…")
+
+        base = f"games/{a.id}"
+        file = f"builds/{version}.pck"
+        manifest = read_json(f"{base}/manifest.json", None) or {"schema": SCHEMA, "id": a.id, "channels": {}}
+        manifest |= {"schema": SCHEMA, "id": a.id, "name": g["name"], "godot": ev,
+                     "extensions": g.get("extensions", {}), "args": g.get("args", [])}
+        manifest["channels"][channel] = {"version": version, "file": file, "size": size, "sha256": digest,
+                                         "commit": commit, "notes": notes,
+                                         "published": now.isoformat().replace("+00:00", "Z")}
+        # newest first per channel; readers ignore this, it's for pruning
+        history = manifest.setdefault("history", {})
+        hist = [f for f in history.get(channel, []) if f != file]
+        history[channel] = [file] + hist
+        keep = {f for ch in history.values() for f in ch[:a.keep]} | {c["file"] for c in manifest["channels"].values()}
+        prune = sorted({f for ch in history.values() for f in ch} - keep)
+        for ch in history:
+            history[ch] = [f for f in history[ch] if f in keep]
+
+        index = read_json("games/index.json", None) or {"schema": SCHEMA, "games": []}
+        entry = {"id": a.id, "name": g["name"], "tagline": g.get("tagline", ""), "order": g.get("order", 100),
+                 "hidden": g.get("hidden", False)}
+        others = [e for e in index["games"] if e.get("id") != a.id]
+        index_changed = entry not in index["games"]
+        index |= {"schema": SCHEMA, "games": sorted(others + [entry], key=lambda e: (e.get("order", 100), e["id"]))}
+
+        if a.dry_run:
+            step("dry run: would upload")
+            print(f"   {PREFIX}{base}/{file}\n   {PREFIX}{base}/manifest.json" + (f"\n   {PREFIX}games/index.json" if index_changed else ""))
+            if prune:
+                print("   and delete: " + ", ".join(prune))
+            print(json.dumps(manifest, indent=2))
+            return
+
+        step("uploading")
+        if size_in_bucket(f"{base}/{file}") == size:
+            print(f"   {file} is already up")
+        else:
+            upload(pck, f"{base}/{file}", IMMUTABLE, "application/octet-stream")
+        upload_json(manifest, f"{base}/manifest.json", tmp)
+        if index_changed:
+            index["updated"] = now.isoformat().replace("+00:00", "Z")
+            upload_json(index, "games/index.json", tmp)
+        for f in prune:
+            run(["rclone", "deletefile", key(f"{base}/{f}")], check=False)
+        if prune:
+            print(f"   pruned {len(prune)} old build(s)")
+
+    if needs_tag:
+        git(project, "tag", "-a", version, "-m", f"{g['name']} {version}")
+        print(f"   tagged {version}")
+    if a.no_push:
+        print("   not pushing (--no-push)")
+    elif not git(project, "remote", check=False):
+        print("   no git remote, so nothing pushed (step 2.5)")
+    else:
+        step("pushing to GitHub")
+        git(project, "push", "origin", "HEAD")
+        if needs_tag:
+            git(project, "push", "origin", version)
+
+    step(f"published {version} to {channel}: {PUBLIC}/{PREFIX}games/{a.id}/manifest.json")
+
+
+if __name__ == "__main__":
+    main()
