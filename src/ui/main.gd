@@ -37,6 +37,9 @@ var _status_text := Label.new()
 var _check := Button.new()
 var _auto := CheckButton.new()
 var _toasts := VBoxContainer.new()
+var _banner_button := Button.new()
+var _update_card := PanelContainer.new()
+var _update_text := Label.new()
 var _drawer := Drawer.new()
 var _shown := 0
 
@@ -56,7 +59,9 @@ func _ready() -> void:
 	tick.timeout.connect(_sync)
 	add_child(tick)
 	_auto.set_pressed_no_signal(lib.auto_update)
+	lib.launcher_changed.connect(_apply_view)
 	_sync()
+	lib.mark_started()
 	_dev_flags()
 
 
@@ -148,6 +153,28 @@ func _build_sidebar() -> Control:
 	spacer.size_flags_vertical = SIZE_EXPAND_FILL
 	v.add_child(spacer)
 
+	var card := Style.box(Color(Style.GOLD, 0.08), 12, Color(Style.GOLD, 0.3), 14, 12)
+	_update_card.add_theme_stylebox_override("panel", card)
+	_update_card.visible = false
+	v.add_child(_update_card)
+	var uv := VBoxContainer.new()
+	uv.add_theme_constant_override("separation", 8)
+	_update_card.add_child(uv)
+	var ut := Label.new()
+	ut.text = "Launcher update ready"
+	ut.add_theme_font_override("font", Style.sans(600))
+	ut.add_theme_color_override("font_color", Style.GOLD_PALE)
+	uv.add_child(ut)
+	_update_text.theme_type_variation = "Mono"
+	uv.add_child(_update_text)
+	var restart := Button.new()
+	restart.text = "Restart to update"
+	restart.theme_type_variation = "PrimaryButton"
+	restart.mouse_default_cursor_shape = CURSOR_POINTING_HAND
+	restart.pressed.connect(lib.restart)
+	uv.add_child(restart)
+	v.add_child(_gap(14))
+
 	var status := HBoxContainer.new()
 	status.add_theme_constant_override("separation", 9)
 	var status_pad := MarginContainer.new()
@@ -171,7 +198,9 @@ func _build_sidebar() -> Control:
 	v.add_child(_auto)
 	v.add_child(_gap(6))
 	var version := Label.new()
-	version.text = "Launcher %s  ·  Godot %s" % [ProjectSettings.get_setting("application/config/version"), lib.engine_version]
+	version.text = "Launcher %s  ·  engine %s" % [lib.ui_version, lib.engine_build]
+	version.tooltip_text = "Godot %s" % lib.engine_version
+	version.mouse_filter = MOUSE_FILTER_PASS
 	version.add_theme_font_override("font", Style.mono())
 	version.add_theme_font_size_override("font_size", 10)
 	version.add_theme_color_override("font_color", Color(Style.DIM, 0.7))
@@ -253,11 +282,14 @@ func _build_library() -> Control:
 	_banner_text.add_theme_color_override("font_color", Color("#f2b8aa"))
 	_banner_text.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	brow.add_child(_banner_text)
-	var retry := Button.new()
-	retry.text = "Try again"
-	retry.theme_type_variation = "GhostButton"
-	retry.pressed.connect(lib.refresh)
-	brow.add_child(retry)
+	_banner_button.theme_type_variation = "GhostButton"
+	_banner_button.mouse_default_cursor_shape = CURSOR_POINTING_HAND
+	_banner_button.pressed.connect(func() -> void:
+		if lib.engine_outdated or lib.launcher_outdated:
+			OS.shell_open(lib.launcher_download_url())
+		else:
+			lib.refresh())
+	brow.add_child(_banner_button)
 
 	var area := Control.new()  # the grid and the empty state share this space
 	area.size_flags_vertical = SIZE_EXPAND_FILL
@@ -389,11 +421,16 @@ func _apply_view() -> void:
 	_empty_title.text = empty[0]
 	_empty_body.text = empty[1]
 
-	_banner.visible = (not lib.online and not lib.refreshing and lib.last_check > 0) or lib.launcher_outdated
-	if lib.launcher_outdated:
-		_banner_text.text = "There's a newer launcher. Download it from trismegstudios.com to see every game."
+	var new_exe := lib.engine_outdated or lib.launcher_outdated
+	_banner.visible = new_exe or (not lib.online and not lib.refreshing and lib.last_check > 0)
+	if new_exe:
+		_banner_text.text = "A new version of the launcher is out. Download it to keep getting updates."
+		_banner_button.text = "Download"
 	else:
 		_banner_text.text = "Offline. Showing the library from %s; installed games still play." % Fmt.ago(lib.last_check)
+		_banner_button.text = "Try again"
+	_update_card.visible = not lib.ui_ready.is_empty()
+	_update_text.text = "%s → %s" % [Fmt.short_version(lib.ui_version), Fmt.short_version(lib.ui_ready)]
 
 	if lib.refreshing:
 		_status_text.text = "Checking for updates…"

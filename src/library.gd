@@ -10,10 +10,10 @@ signal catalog_changed  ## games came or went, a refresh started or finished
 signal game_changed(id: String)
 signal progress(id: String)  ## a download moved; read done, total and speed off the game
 signal installed(id: String, version: String)
+signal launcher_changed  ## a launcher update was found or finished downloading
 
 enum Status { INSTALL, UPDATE, READY, BUSY, RUNNING, BLOCKED, UNAVAILABLE }
 
-const BASE := "https://builds.trismegstudios.com/"
 const SCHEMA := 1
 const RECENT := 3 * 86400  ## builds newer than this count as "recently updated"
 const REFRESH_EVERY := 300.0
@@ -22,6 +22,8 @@ const RETRIES := 3
 const STATE := "user://state.json"
 const CACHE := "user://cache/"
 const GAMES := "user://games/"
+const UI_DIR := "user://launcher/ui/"
+const UI_STATE := "user://launcher/ui.json"  ## shared with boot.gd
 
 
 class Game:
@@ -60,6 +62,12 @@ var last_check := 0
 var auto_update := false
 var launcher_outdated := false  ## the server speaks a newer format than this launcher
 var engine_version := "%d.%d" % [Engine.get_version_info().major, Engine.get_version_info().minor]
+## The bucket. TRISMEG_BASE points a launcher at a copy of it, e.g. ".../_test/" for testing.
+var base := OS.get_environment("TRISMEG_BASE").trim_suffix("/") + "/" if OS.has_environment("TRISMEG_BASE") else "https://builds.trismegstudios.com/"
+var ui_version: String = _build_info().get("version", "dev")  ## this UI's build, from the publish script
+var engine_build: String = ProjectSettings.get_setting("trismeg/engine_version", "dev")  ## the exe's
+var ui_ready := ""  ## a newer UI that is downloaded and starts with the next launch
+var engine_outdated := false  ## a newer exe is out; only a fresh download gets it
 
 var _transfers := {}
 
@@ -196,6 +204,7 @@ func refresh() -> void:
 			_fetch_cover(g)
 		if auto_update:
 			update_all()
+	_check_launcher()
 
 
 ## Downloads the latest build of the game's channel, checks it, and swaps it in. The build
@@ -221,7 +230,7 @@ func install(id: String) -> void:
 		game_changed.emit(id)
 		problem = await _verify(path, b)
 	if problem:
-		problem = await _download_verified(g, BASE + "games/%s/%s" % [id, b.file], path, b)
+		problem = await _download_verified(g, base + "games/%s/%s" % [id, b.file], path, b)
 	g.task = ""
 	if problem == "cancelled":
 		pass
@@ -465,7 +474,7 @@ func _apply_index(index: Dictionary) -> void:
 
 
 func _fetch_json(path: String) -> Variant:
-	var r := await _request(BASE + path)
+	var r := await _request(base + path)
 	if r.problem:
 		return null
 	return JSON.parse_string((r.body as PackedByteArray).get_string_from_utf8())
@@ -476,7 +485,7 @@ func _fetch_cover(g: Game) -> void:
 		return
 	g.cover_checked = true
 	var path := CACHE + "covers/%s.png" % g.id
-	var r := await _request(BASE + "games/%s/cover.png" % g.id, path + ".tmp")
+	var r := await _request(base + "games/%s/cover.png" % g.id, path + ".tmp")
 	if r.problem:
 		DirAccess.remove_absolute(path + ".tmp")
 		return
@@ -500,9 +509,9 @@ func _load_cover(g: Game) -> void:
 			return
 
 
-func _request(url: String, to_file := "") -> Dictionary:
+func _request(url: String, to_file := "", timeout := 15.0) -> Dictionary:
 	var http := HTTPRequest.new()
-	http.timeout = 15.0
+	http.timeout = timeout
 	http.download_file = to_file
 	add_child(http)
 	var out := {"problem": "Couldn't start the request", "body": PackedByteArray()}
@@ -528,6 +537,93 @@ static func _http_problem(result: int, code: int) -> String:
 		HTTPRequest.RESULT_TIMEOUT:
 			return "Timed out"
 	return "Download failed (%d)" % result
+
+
+# --- the launcher itself ---------------------------------------------------
+# launcher/manifest.json names the current UI pack and engine. A newer UI pack downloads in
+# the background and starts with the next launch (boot.gd loads it). A newer engine needs a
+# fresh download from the website, so that only shows a notice.
+
+func platform() -> String:
+	return {"Windows": "windows", "macOS": "macos"}.get(OS.get_name(), "linux")
+
+
+func launcher_download_url() -> String:
+	return base + "launcher/TrismegLauncher-%s.zip" % platform()
+
+
+## The library is on screen, so the UI pack boot.gd loaded (if any) works.
+func mark_started() -> void:
+	var state: Variant = _read_json(UI_STATE)
+	if state is Dictionary and state.get("booting", false):
+		state.booting = false
+		_write_json(UI_STATE, state)
+
+
+func restart() -> void:
+	OS.set_restart_on_exit(true, OS.get_cmdline_args())
+	get_tree().quit()
+
+
+func _check_launcher() -> void:
+	var m: Variant = await _fetch_json("launcher/manifest.json")
+	if not m is Dictionary:
+		return
+	var engine: Dictionary = m.get("engine", {})
+	engine_outdated = engine_build != "dev" and _semver_less(engine_build, engine.get("version", "0.0.0"))
+	launcher_changed.emit()
+	var ui: Dictionary = m.get("ui", {})
+	if ui.is_empty() or engine_build == "dev" or OS.has_feature("editor"):
+		return  # a dev build runs its own source, never a downloaded UI
+	var version: String = ui.get("version", "")
+	if version in [ui_version, ui_ready] or _semver_less(engine_build, ui.get("min_engine", "0.0.0")):
+		return
+	var state: Variant = _read_json(UI_STATE)
+	if not state is Dictionary:
+		state = {}
+	if version in state.get("bad", []):
+		return
+	DirAccess.make_dir_recursive_absolute(UI_DIR)
+	var path := UI_DIR + version + ".pck"
+	var r := await _request(base + "launcher/" + ui.file, path + ".part", 300.0)
+	var problem: String = r.problem
+	if problem.is_empty():
+		problem = await _verify(path + ".part", ui)
+	if problem:
+		DirAccess.remove_absolute(path + ".part")
+		push_warning("launcher update %s: %s" % [version, problem])
+		return
+	DirAccess.remove_absolute(path)
+	DirAccess.rename_absolute(path + ".part", path)
+	state.previous = state.get("current", "")
+	state.current = path
+	state.version = version
+	state.engine = engine_build
+	state.booting = false
+	_write_json(UI_STATE, state)
+	for f in DirAccess.get_files_at(UI_DIR):
+		if not (UI_DIR + f) in [state.current, state.previous]:
+			DirAccess.remove_absolute(UI_DIR + f)
+	ui_ready = version
+	launcher_changed.emit()
+
+
+static func _build_info() -> Dictionary:
+	if not FileAccess.file_exists("res://build_info.json"):
+		return {}
+	var info: Variant = JSON.parse_string(FileAccess.get_file_as_string("res://build_info.json"))
+	return info if info is Dictionary else {}
+
+
+static func _semver_less(a: String, b: String) -> bool:
+	var x := a.trim_prefix("v").split(".")
+	var y := b.trim_prefix("v").split(".")
+	for i in 3:
+		var p := int(x[i]) if i < x.size() else 0
+		var q := int(y[i]) if i < y.size() else 0
+		if p != q:
+			return p < q
+	return false
 
 
 # --- disk ------------------------------------------------------------------

@@ -4,11 +4,19 @@
   trismeg-publish <id>                      beta build of HEAD
   trismeg-publish <id> --stable [vX.Y.Z]    stable build; tags HEAD with the version
                                             unless HEAD is already tagged
+  trismeg-publish launcher                  the launcher's UI pack, from this repo; every
+                                            launcher picks it up and applies it on restart
+  trismeg-publish launcher --engine         also the launcher exe for Windows, macOS and
+                                            Linux (whichever export templates are installed).
+                                            Raise [trismeg] engine_version in project.godot
+                                            first; launchers on an older engine get a
+                                            "download the new launcher" notice
 Options:
   --notes "text"    release notes (default: the last commit's subject)
   --dry-run         export and build the manifest, but upload, tag and push nothing
   --no-push         publish, but don't push the commit and tag to GitHub
   --keep N          builds to keep per channel (default 3)
+  --engine          (launcher only) also export and upload the engine exe
 
 Follows "Build format v1" on the Trismeg Launcher page in Notion:
   1. refuses to run with uncommitted changes
@@ -34,6 +42,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 REMOTE = "r2:trismeg-launcher"
@@ -146,21 +155,20 @@ def version_for(project: Path, stable: bool, wanted: str | None) -> tuple[str, b
     return f"v0.0.0-{count}-g{git(project, 'rev-parse', '--short=7', 'HEAD')}", False
 
 
-def export_pck(project: Path, out: Path, build_info: dict) -> None:
+def export(project: Path, out: Path, build_info: dict, preset: str = PRESET, mode: str = "--export-pack") -> None:
     info_file = project / "build_info.json"
     if info_file.exists():
         fail(f"{info_file} already exists (left over from another export?); delete it first")
     before = (project / "project.godot").read_bytes()
     info_file.write_text(json.dumps(build_info) + "\n")
     try:
-        r = subprocess.run([GODOT, "--headless", "--path", str(project), "--export-pack", PRESET, str(out)],
+        r = subprocess.run([GODOT, "--headless", "--path", str(project), mode, preset, str(out)],
                            capture_output=True, text=True)
     finally:
         info_file.unlink(missing_ok=True)
-    log = out.with_suffix(".log")
-    log.write_text(r.stdout + r.stderr)
     if r.returncode != 0 or not out.exists() or out.stat().st_size == 0:
-        fail(f"export failed, see {log}")
+        errors = [l for l in (r.stdout + r.stderr).splitlines() if "ERROR" in l or l.startswith("   ")]
+        fail(f"exporting \"{preset}\" failed:\n" + "\n".join(errors[-12:]))
     if (project / "project.godot").read_bytes() != before:
         (project / "project.godot").write_bytes(before)
         print("   (Godot rewrote project.godot during the export; put it back)")
@@ -184,7 +192,12 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-push", action="store_true")
     ap.add_argument("--keep", type=int, default=3)
+    ap.add_argument("--engine", action="store_true")
     a = ap.parse_args()
+    if a.id == "launcher":
+        return publish_launcher(a)
+    if a.engine:
+        fail("--engine only applies to the launcher")
 
     games = json.loads(GAMES.read_text())
     if a.id not in games:
@@ -218,7 +231,7 @@ def main() -> None:
         tmp = Path(t)
         pck = tmp / f"{version}.pck"
         step(f"exporting \"{PRESET}\" with Godot {ev}")
-        export_pck(project, pck, build_info)
+        export(project, pck, build_info)
         size, digest = pck.stat().st_size, sha256(pck)
         print(f"   {size / 1e6:.1f} MB, sha256 {digest[:12]}…")
 
@@ -268,10 +281,15 @@ def main() -> None:
         if prune:
             print(f"   pruned {len(prune)} old build(s)")
 
+    tag_and_push(project, version, needs_tag, g["name"], a.no_push)
+    step(f"published {version} to {channel}: {PUBLIC}/{PREFIX}games/{a.id}/manifest.json")
+
+
+def tag_and_push(project: Path, version: str, needs_tag: bool, name: str, no_push: bool) -> None:
     if needs_tag:
-        git(project, "tag", "-a", version, "-m", f"{g['name']} {version}")
+        git(project, "tag", "-a", version, "-m", f"{name} {version}")
         print(f"   tagged {version}")
-    if a.no_push:
+    if no_push:
         print("   not pushing (--no-push)")
     elif not git(project, "remote", check=False):
         print("   no git remote, so nothing pushed (step 2.5)")
@@ -281,7 +299,142 @@ def main() -> None:
         if needs_tag:
             git(project, "push", "origin", version)
 
-    step(f"published {version} to {channel}: {PUBLIC}/{PREFIX}games/{a.id}/manifest.json")
+
+# --- the launcher ----------------------------------------------------------
+
+LAUNCHER = Path(__file__).resolve().parent.parent
+UI_PRESET = "Launcher UI"
+# platform: (export preset, file the export writes, the template it needs)
+ENGINE_PRESETS = {
+    "windows": ("Windows", "Trismeg Launcher.exe", "windows_release_x86_64.exe"),
+    "macos": ("macOS", "TrismegLauncher.zip", "macos.zip"),
+    "linux": ("Linux", "TrismegLauncher.x86_64", "linux_release.x86_64"),
+}
+
+
+def templates_dir() -> Path:
+    full = run([GODOT, "--version"])  # 4.7.stable.official.5b4e0cb0f
+    name = ".".join(full.split(".")[:3])
+    if sys.platform == "darwin":
+        root = Path.home() / "Library/Application Support/Godot/export_templates"
+    elif os.name == "nt":
+        root = Path(os.environ["APPDATA"]) / "Godot/export_templates"
+    else:
+        root = Path.home() / ".local/share/godot/export_templates"
+    return root / name
+
+
+def export_engine(platform: str, out_dir: Path, build_info: dict) -> Path:
+    """Exports the launcher exe for one platform and returns it zipped."""
+    preset, file, _ = ENGINE_PRESETS[platform]
+    folder = out_dir / platform
+    folder.mkdir()
+    zipped = out_dir / f"{platform}.zip"
+    if platform == "macos":  # Godot zips the .app itself, keeping its permissions and signature
+        export(LAUNCHER, zipped, build_info, preset, "--export-release")
+        return zipped
+    export(LAUNCHER, folder / file, build_info, preset, "--export-release")
+    with zipfile.ZipFile(zipped, "w", zipfile.ZIP_DEFLATED) as z:
+        for f in sorted(folder.rglob("*")):
+            info = zipfile.ZipInfo(f"Trismeg Launcher/{f.relative_to(folder)}")
+            info.external_attr = (0o755 if os.access(f, os.X_OK) or f.suffix == ".x86_64" else 0o644) << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            z.writestr(info, f.read_bytes())
+    return zipped
+
+
+def publish_launcher(a) -> None:
+    project = LAUNCHER
+    step(f"Trismeg Launcher (UI{' + engine' if a.engine else ''})"
+         f"{' [dry run]' if a.dry_run else ''}{' [prefix ' + PREFIX + ']' if PREFIX else ''}")
+    if dirty := git(project, "status", "--porcelain"):
+        fail(f"uncommitted changes in {project}; commit or stash them first:\n{dirty}")
+    gv, ev = godot_version(project), engine_version()
+    if gv != ev:
+        fail(f"the launcher is on Godot {gv} but the Godot binary is {ev}")
+    m = re.search(r'engine_version="([^"]+)"', (project / "project.godot").read_text())
+    engine = m.group(1) if m else fail("project.godot has no [trismeg] engine_version")
+
+    stable = a.stable is not False
+    version, needs_tag = version_for(project, stable, a.stable if isinstance(a.stable, str) else None)
+    commit = git(project, "rev-parse", "--short=7", "HEAD")
+    notes = a.notes if a.notes is not None else git(project, "log", "-1", "--format=%s")
+    now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    published = now.isoformat().replace("+00:00", "Z")
+    print(f"   UI {version}, engine {engine}, commit {commit}")
+    build_info = {"version": version, "commit": commit, "stamp": now.astimezone().strftime("%Y-%m-%d %H:%M")}
+
+    manifest = read_json("launcher/manifest.json", None) or {"schema": SCHEMA}
+    live_engine = manifest.get("engine", {}).get("version")
+    if a.engine:
+        if live_engine and not semver(live_engine) < semver(engine):
+            fail(f"engine {live_engine} is already out; raise engine_version in project.godot first")
+    elif not live_engine:
+        fail("no engine is published yet: run with --engine")
+    elif live_engine != engine:
+        fail(f"project.godot says engine {engine} but the bucket has {live_engine}; publish with --engine")
+
+    with tempfile.TemporaryDirectory(prefix="trismeg-publish-") as t:
+        tmp = Path(t)
+        uploads = []  # (local, bucket path, cache, content type), in upload order
+        if a.engine:
+            templates = templates_dir()
+            platforms = {}
+            for platform, (preset, _, template) in ENGINE_PRESETS.items():
+                if not (templates / template).exists():
+                    print(f"   skipping {platform}: no {template} in {templates}")
+                    continue
+                step(f"exporting the {platform} launcher")
+                z = export_engine(platform, tmp, build_info)
+                size = z.stat().st_size
+                print(f"   {size / 1e6:.1f} MB")
+                file = f"engine/{engine}/{platform}.zip"
+                platforms[platform] = {"file": file, "size": size, "sha256": sha256(z)}
+                uploads.append((z, f"launcher/{file}", IMMUTABLE, "application/zip"))
+                uploads.append((z, f"launcher/TrismegLauncher-{platform}.zip", NO_CACHE, "application/zip"))
+            if not platforms:
+                fail("no export templates found for any platform")
+            manifest["engine"] = {"version": engine, "extensions": [], "platforms": platforms}
+
+        step(f"exporting \"{UI_PRESET}\"")
+        pck = tmp / f"{version}.pck"
+        export(project, pck, build_info, UI_PRESET)
+        size = pck.stat().st_size
+        print(f"   {size / 1e6:.1f} MB")
+        file = f"ui/{version}.pck"
+        uploads.append((pck, f"launcher/{file}", IMMUTABLE, "application/octet-stream"))
+        manifest |= {"schema": SCHEMA, "godot": ev}
+        manifest["ui"] = {"version": version, "file": file, "size": size, "sha256": sha256(pck),
+                          "min_engine": engine, "commit": commit, "notes": notes, "published": published}
+        history = manifest.setdefault("history", {})
+        ui_history = [file] + [f for f in history.get("ui", []) if f != file]
+        history["ui"], prune = ui_history[:a.keep], ui_history[a.keep:]
+
+        if a.dry_run:
+            step("dry run: would upload")
+            for _, path, _, _ in uploads:
+                print(f"   {PREFIX}{path}")
+            if prune:
+                print("   and delete: " + ", ".join(prune))
+            print(json.dumps(manifest, indent=2))
+            return
+
+        step("uploading")
+        for local, path, cache, content_type in uploads:
+            upload(local, path, cache, content_type)
+            print(f"   {path}")
+        upload_json(manifest, "launcher/manifest.json", tmp)
+        for f in prune:
+            run(["rclone", "deletefile", key(f"launcher/{f}")], check=False)
+        if prune:
+            print(f"   pruned {len(prune)} old UI build(s)")
+
+    tag_and_push(project, version, needs_tag, "Trismeg Launcher", a.no_push)
+    step(f"published launcher UI {version}: {PUBLIC}/{PREFIX}launcher/manifest.json")
+
+
+def semver(v: str) -> tuple[int, ...]:
+    return tuple(int(p) for p in v.lstrip("v").split("."))
 
 
 if __name__ == "__main__":
