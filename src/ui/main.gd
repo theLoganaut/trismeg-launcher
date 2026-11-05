@@ -359,7 +359,7 @@ func _in_view(g: Library.Game, key: String) -> bool:
 		"recent":
 			return lib.is_recent(g)
 		"available":
-			return g.installed.is_empty() and st != Library.Status.UNAVAILABLE
+			return (g.installed.is_empty() or st == Library.Status.STEAM) and st != Library.Status.UNAVAILABLE
 	return true
 
 

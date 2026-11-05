@@ -1,6 +1,7 @@
 extends PanelContainer
 ## One game in the library grid: its cover with status badges, its name, and the one
-## action that matters right now (Play, Update, Install or Cancel). Click it for details.
+## action that matters right now (Play, Update, Install, Cancel or Open in Steam). Click it
+## for details.
 
 signal opened(id: String)
 
@@ -177,6 +178,8 @@ func refresh() -> void:
 		Library.Status.RUNNING:
 			_set_action("Running", "Button")
 			_action.disabled = true
+		Library.Status.STEAM:
+			_set_action("Open in Steam", "PrimaryButton")
 		_:
 			_action.visible = false
 	_bar.visible = st == Library.Status.BUSY

@@ -4,6 +4,7 @@
     "name": "Collimators: Frontlines",
     "tagline": "Turn-based mech roguelike where your loadout is your deck",
     "order": 10,
+    "steam_app_id": 5441720,
     "extensions": { "godotsteam": "optional" },
     "env_file": "tools/steam/config.sh",
     "build_info_env": { "feedback_webhook": "FEEDBACK_WEBHOOK" }

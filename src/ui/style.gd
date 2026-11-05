@@ -220,4 +220,6 @@ static func look(lib: Library, g: Library.Game) -> Array:
 			return ["Playing", RUNNING]
 		Library.Status.BLOCKED:
 			return ["Needs launcher update", BLOCKED]
+		Library.Status.STEAM:
+			return ["On Steam", MIST]
 	return ["Offline" if not lib.online else "No build yet", DIM]

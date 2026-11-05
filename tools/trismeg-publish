@@ -4,6 +4,9 @@
   trismeg-publish <id>                      beta build of HEAD
   trismeg-publish <id> --stable [vX.Y.Z]    stable build; tags HEAD with the version
                                             unless HEAD is already tagged
+                                            (a game with steam_app_id in games.json is on
+                                            Steam: this only updates its listing, which opens
+                                            Steam, and removes any builds of it from the bucket)
   trismeg-publish launcher                  the launcher's UI pack, from this repo; every
                                             launcher picks it up and applies it on restart
   trismeg-publish launcher --engine         also the launcher exe for Windows, macOS and
@@ -203,6 +206,8 @@ def main() -> None:
     if a.id not in games:
         fail(f"unknown game {a.id!r}; known: {', '.join(games)} (add it to {GAMES})")
     g = games[a.id]
+    if g.get("steam_app_id"):
+        return publish_steam_game(a, g)
     project = Path(os.path.expanduser(g["path"]))
     stable = a.stable is not False
     channel = "stable" if stable else "beta"
@@ -253,11 +258,7 @@ def main() -> None:
             history[ch] = [f for f in history[ch] if f in keep]
 
         index = read_json("games/index.json", None) or {"schema": SCHEMA, "games": []}
-        entry = {"id": a.id, "name": g["name"], "tagline": g.get("tagline", ""), "order": g.get("order", 100),
-                 "hidden": g.get("hidden", False)}
-        others = [e for e in index["games"] if e.get("id") != a.id]
-        index_changed = entry not in index["games"]
-        index |= {"schema": SCHEMA, "games": sorted(others + [entry], key=lambda e: (e.get("order", 100), e["id"]))}
+        index_changed = add_to_index(index, a.id, g)
 
         if a.dry_run:
             step("dry run: would upload")
@@ -283,6 +284,48 @@ def main() -> None:
 
     tag_and_push(project, version, needs_tag, g["name"], a.no_push)
     step(f"published {version} to {channel}: {PUBLIC}/{PREFIX}games/{a.id}/manifest.json")
+
+
+def add_to_index(index: dict, game_id: str, g: dict) -> bool:
+    """Puts the game's entry in the index; True if that changed anything."""
+    entry = {"id": game_id, "name": g["name"], "tagline": g.get("tagline", ""), "order": g.get("order", 100),
+             "hidden": g.get("hidden", False)}
+    if g.get("steam_app_id"):
+        entry["steam_app_id"] = g["steam_app_id"]
+    changed = entry not in index["games"]
+    others = [e for e in index["games"] if e.get("id") != game_id]
+    index |= {"schema": SCHEMA, "games": sorted(others + [entry], key=lambda e: (e.get("order", 100), e["id"]))}
+    return changed
+
+
+def publish_steam_game(a, g: dict) -> None:
+    """A game on Steam is only listed here. The bucket is public, so its builds can't stay in it."""
+    if a.stable is not False or a.notes is not None:
+        fail(f"{g['name']} is on Steam, so its builds and notes go out through Steam, not here")
+    step(f"{g['name']} is on Steam (app {g['steam_app_id']}): listing only, no build"
+         f"{' [dry run]' if a.dry_run else ''}{' [prefix ' + PREFIX + ']' if PREFIX else ''}")
+    base = f"games/{a.id}"
+    remove = [f"{base}/builds/{f}" for f in run(["rclone", "lsf", key(f"{base}/builds/")]).splitlines()]
+    if size_in_bucket(f"{base}/manifest.json") is not None:
+        remove.append(f"{base}/manifest.json")
+    index = read_json("games/index.json", None) or {"schema": SCHEMA, "games": []}
+    changed = add_to_index(index, a.id, g)
+
+    if a.dry_run:
+        step("dry run: would change")
+        print(f"   {PREFIX}games/index.json: " + ("update the listing" if changed else "already up to date"))
+        for path in remove:
+            print(f"   delete {PREFIX}{path}")
+        return
+    if changed:  # the listing goes first, so nothing still points at the builds being deleted
+        index["updated"] = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        with tempfile.TemporaryDirectory(prefix="trismeg-publish-") as t:
+            upload_json(index, "games/index.json", Path(t))
+        print("   updated the listing")
+    for path in remove:
+        run(["rclone", "deletefile", key(path)])
+        print(f"   deleted {path}")
+    step(f"listed: the launcher opens {g['name']} in Steam")
 
 
 def tag_and_push(project: Path, version: str, needs_tag: bool, name: str, no_push: bool) -> None:

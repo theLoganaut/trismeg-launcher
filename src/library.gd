@@ -12,7 +12,7 @@ signal progress(id: String)  ## a download moved; read done, total and speed off
 signal installed(id: String, version: String)
 signal launcher_changed  ## a launcher update was found or finished downloading
 
-enum Status { INSTALL, UPDATE, READY, BUSY, RUNNING, BLOCKED, UNAVAILABLE }
+enum Status { INSTALL, UPDATE, READY, BUSY, RUNNING, BLOCKED, UNAVAILABLE, STEAM }
 
 const SCHEMA := 1
 const RECENT := 3 * 86400  ## builds newer than this count as "recently updated"
@@ -31,6 +31,7 @@ class Game:
 	var name := ""
 	var tagline := ""
 	var order := 100
+	var steam_app := 0  ## set when the game is on Steam: Steam delivers it, the launcher hosts no builds
 	var manifest := {}
 	var channel := "stable"  ## the player's pick; latest() falls back to whatever exists
 	var installed := {}  ## the manifest entry of the build on disk, plus channel and path
@@ -143,6 +144,8 @@ func status(g: Game) -> Status:
 		return Status.RUNNING
 	if g.task:
 		return Status.BUSY
+	if g.steam_app:
+		return Status.STEAM
 	var b := latest(g)
 	if g.installed.is_empty():
 		if b.is_empty():
@@ -172,6 +175,8 @@ func act(id: String) -> void:
 			install(id)
 		Status.BUSY:
 			cancel(id)
+		Status.STEAM:
+			open_steam(id)
 
 
 func update_all() -> void:
@@ -191,6 +196,8 @@ func refresh() -> void:
 		_write_json(CACHE + "index.json", index)
 		_apply_index(index)
 		for id: String in games.keys():
+			if games[id].steam_app:
+				continue
 			var m: Variant = await _fetch_json("games/%s/manifest.json" % id)
 			if m is Dictionary and games.has(id):
 				games[id].manifest = m
@@ -260,6 +267,30 @@ func cancel(id: String) -> void:
 	if t:
 		t.http.cancel_request()
 		t.finished.emit("cancelled")
+
+
+## Steam runs the game if the player owns it, and offers to install it first if it isn't on
+## this machine. Without Steam, the store page is the only place to send them.
+func open_steam(id: String) -> void:
+	var g: Game = games.get(id)
+	if g == null or not g.steam_app:
+		return
+	var url := "steam://run/%d" if has_steam() else "https://store.steampowered.com/app/%d/"
+	g.error = "Couldn't open Steam" if OS.shell_open(url % g.steam_app) != OK else ""
+	game_changed.emit(id)
+
+
+func has_steam() -> bool:
+	var home := OS.get_environment("HOME")
+	match OS.get_name():
+		"Windows":
+			return OS.execute("reg", ["query", "HKCU\\Software\\Valve\\Steam"]) == 0
+		"macOS":
+			return DirAccess.dir_exists_absolute("/Applications/Steam.app") or DirAccess.dir_exists_absolute(home + "/Applications/Steam.app")
+	for dir in ["/.steam", "/.local/share/Steam", "/.var/app/com.valvesoftware.Steam"]:
+		if DirAccess.dir_exists_absolute(home + dir):
+			return true
+	return false
 
 
 func play(id: String) -> void:
@@ -375,7 +406,7 @@ func uninstall(id: String) -> void:
 	g.installed = {}
 	g.previous = {}
 	g.error = ""
-	if g.manifest.is_empty():
+	if g.manifest.is_empty() and not g.steam_app:
 		games.erase(id)
 	_save()
 	game_changed.emit(id)
@@ -531,6 +562,10 @@ func _apply_index(index: Dictionary) -> void:
 		g.name = e.get("name", e.id)
 		g.tagline = e.get("tagline", "")
 		g.order = int(e.get("order", 100))
+		g.steam_app = int(e.get("steam_app_id", 0))
+		if g.steam_app:  # it may have had builds here before it moved to Steam
+			g.manifest = {}
+			DirAccess.remove_absolute(CACHE + e.id + ".json")
 		listed[e.id] = true
 	for id: String in games.keys():
 		if not listed.has(id) and games[id].installed.is_empty():

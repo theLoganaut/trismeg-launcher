@@ -1,6 +1,7 @@
 extends Control
-## One game's details: versions, channel, release notes, rollback and uninstall. Slides
-## in from the right over a dimmed library; Esc or a click outside closes it.
+## One game's details: versions, channel, release notes, rollback and uninstall, or for a
+## game on Steam just the way there. Slides in from the right over a dimmed library; Esc or
+## a click outside closes it.
 
 const CoverView := preload("res://src/ui/cover_view.gd")
 const WIDTH := 470.0
@@ -27,6 +28,9 @@ var _progress := VBoxContainer.new()
 var _bar := ProgressBar.new()
 var _progress_label := Label.new()
 var _error := Label.new()
+var _steam_note := Label.new()
+var _builds := VBoxContainer.new()
+var _foot_rule := _rule()
 var _channels := {}
 var _channel_note := Label.new()
 var _facts := GridContainer.new()
@@ -141,11 +145,18 @@ func setup(library: Library) -> void:
 	_error.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	v.add_child(_error)
 
-	v.add_child(_rule())
-	v.add_child(_caps("Channel"))
+	_steam_note.text = "This game is on Steam. If you own it or have a tester key, it opens there."
+	_steam_note.theme_type_variation = "Dim"
+	_steam_note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	v.add_child(_steam_note)
+
+	_builds.add_theme_constant_override("separation", 14)
+	v.add_child(_builds)
+	_builds.add_child(_rule())
+	_builds.add_child(_caps("Channel"))
 	var seg := PanelContainer.new()
 	seg.add_theme_stylebox_override("panel", Style.box(Style.VOID_LIFT, 10, Style.RULE, 4, 4))
-	v.add_child(seg)
+	_builds.add_child(seg)
 	var seg_row := HBoxContainer.new()
 	seg_row.add_theme_constant_override("separation", 4)
 	seg.add_child(seg_row)
@@ -163,23 +174,23 @@ func setup(library: Library) -> void:
 		_channels[ch] = b
 	_channel_note.theme_type_variation = "Dim"
 	_channel_note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	v.add_child(_channel_note)
+	_builds.add_child(_channel_note)
 
-	v.add_child(_caps("Build"))
+	_builds.add_child(_caps("Build"))
 	_facts.columns = 2
 	_facts.add_theme_constant_override("h_separation", 18)
 	_facts.add_theme_constant_override("v_separation", 8)
-	v.add_child(_facts)
+	_builds.add_child(_facts)
 
-	v.add_child(_caps("What's new"))
+	_builds.add_child(_caps("What's new"))
 	var notes_box := PanelContainer.new()
 	notes_box.add_theme_stylebox_override("panel", Style.box(Style.PANEL, 10, Style.RULE, 16, 14))
-	v.add_child(notes_box)
+	_builds.add_child(notes_box)
 	_notes.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	_notes.theme_type_variation = "Mist"
 	notes_box.add_child(_notes)
 
-	v.add_child(_rule())
+	v.add_child(_foot_rule)
 	var foot := HBoxContainer.new()
 	foot.add_theme_constant_override("separation", 4)
 	v.add_child(foot)
@@ -284,6 +295,8 @@ func refresh() -> void:
 			_primary.text = "Playing…"
 			_primary.disabled = true
 			_primary.theme_type_variation = "Button"
+		Library.Status.STEAM:
+			_primary.text = "Open in Steam"
 		Library.Status.BLOCKED:
 			_primary.text = lib.blocked_reason(g)
 			_primary.disabled = true
@@ -299,6 +312,10 @@ func refresh() -> void:
 	_show_progress()
 	_error.text = g.error
 	_error.visible = not g.error.is_empty()
+	var steam := st == Library.Status.STEAM
+	_steam_note.visible = steam
+	_builds.visible = not steam
+	_foot_rule.visible = not steam or not g.installed.is_empty()
 
 	for ch: String in _channels:
 		_channels[ch].set_pressed_no_signal(g.channel == ch)
@@ -327,14 +344,14 @@ func refresh() -> void:
 	_notes.text = notes if notes else "No notes for this build."
 
 	var idle := st not in [Library.Status.BUSY, Library.Status.RUNNING]
-	_rollback.visible = not g.previous.is_empty()
+	_rollback.visible = not g.previous.is_empty() and not steam
 	_rollback.disabled = not idle
 	if _rollback.visible:
 		_rollback.text = "Roll back to %s" % Fmt.short_version(g.previous.version)
 	_files.visible = not g.installed.is_empty()
 	_uninstall.visible = not g.installed.is_empty()
 	_uninstall.disabled = not idle
-	_uninstall.text = "Click again to uninstall" if _confirm_uninstall else "Uninstall"
+	_uninstall.text = "Click again to remove" if _confirm_uninstall else ("Remove old launcher copy" if steam else "Uninstall")
 
 
 func _show_progress() -> void:
